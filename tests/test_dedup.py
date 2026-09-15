@@ -1,5 +1,9 @@
-from agent.dedup import canonicalize_url, dedup_exact
+from agent.dedup import canonicalize_url, dedup_exact, dedup_near
 from agent.types import SearchResult
+
+
+def _res(url, title, snippet="s"):
+    return SearchResult(url=url, title=title, snippet=snippet, source="tavily", sub_query="q")
 
 
 def test_canonicalize_strips_tracking_params():
@@ -22,3 +26,26 @@ def test_dedup_exact_removes_duplicate_urls():
     ]
     deduped = dedup_exact(results)
     assert len(deduped) == 2
+
+
+def test_dedup_near_removes_identical():
+    text = "the quick brown fox jumps over the lazy dog"
+    results = [
+        _res("https://a.com/x", text, text),
+        _res("https://b.com/y", text, text),
+    ]
+    assert len(dedup_near(results)) == 1
+
+
+def test_dedup_near_keeps_different():
+    results = [
+        _res("https://a.com/x", "Feline behaviour", "cats dogs pets"),
+        _res("https://b.com/y", "Quantum computing", "qubit entanglement error correction"),
+    ]
+    assert len(dedup_near(results)) == 2
+
+
+def test_dedup_near_single_and_empty():
+    assert dedup_near([]) == []
+    single = _res("https://a.com/x", "T", "S")
+    assert dedup_near([single]) == [single]

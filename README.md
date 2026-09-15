@@ -26,20 +26,23 @@ question
  plan            → LLM decomposes into 1-4 sub-queries (or passes through
    │                the original question for simple factual asks)
    ▼
- search           → Tavily + DuckDuckGo queried concurrently, one thread
-   │                 per (provider, sub-query) pair. Failures are caught
-   │                 per-pair and recorded, not raised.
+ search           → Tavily + DuckDuckGo. Official APIs (Tavily) fan out one
+   │                 thread per (provider, sub-query), isolated per pair;
+   │                 scrapers (DuckDuckGo) declare `parallel_ok=False` and
+   │                 run their sub-queries sequentially in one worker.
    ▼
  dedup            → (1) exact: canonicalize URLs (strip tracking params,
    │                 trailing slash, scheme) and drop exact repeats.
-   │                 (2) near-duplicate: embed title+snippet with
-   │                 all-MiniLM-L6-v2 and drop anything >0.92 cosine
-   │                 similarity to an already-kept result.
+   │                 (2) near-duplicate: word-shingle Jaccard on
+   │                 title+snippet by default (dependency-free); use
+   │                 all-MiniLM-L6-v2 cosine (>0.92) instead with
+   │                 RESEARCH_AGENT_EMBEDDINGS=1.
    ▼
- rank             → embedding similarity of each result to the *original*
-   │                 question (not the sub-query), plus a small bonus for
-   │                 the top result from each source so one provider can't
-   │                 crowd out the other. Top-k kept (default 8).
+ rank             → lexical token-overlap with the *original* question (not
+   │                 the sub-query) plus a small bonus for the top result
+   │                 from each source so one provider can't crowd out the
+   │                 other. Embedding similarity replaces the lexical score
+   │                 only when embeddings are enabled. Top-k kept (default 8).
 ▼
  fetch            → full-page content is fetched (via trafilatura) only for
    │                 the top N ranked results (default 5) — the rest rely
@@ -87,11 +90,13 @@ un-canonicalized results:
 1. **Exact** — canonicalize the URL (lowercase, strip `utm_*`/`ref`/`fbclid`
    params, drop trailing slash) and drop exact repeats. Cheap, catches the
    common case (same article returned by both providers).
-2. **Near-duplicate** — embed `title + snippet` and drop anything above a
-   0.92 cosine-similarity threshold to a result already kept. Catches
-   syndicated copies living at different URLs. Runs after exact dedup so
-   the O(n²) comparison only has to look at the smaller, already-deduped
-   set.
+2. **Near-duplicate** — by default, word-shingle (5-gram) Jaccard on
+   `title + snippet` drops anything ≥0.75 similar to a result already kept.
+   Pure Python and dependency-free. With `RESEARCH_AGENT_EMBEDDINGS=1`,
+   `title + snippet` is embedded with all-MiniLM-L6-v2 and anything >0.92
+   cosine similarity is dropped instead — better on paraphrase-style dupes
+   at the cost of heavy native deps. Runs after exact dedup so the O(n²)
+   comparison only has to look at the smaller, already-deduped set.
 
 ### Conflict handling
 
@@ -120,9 +125,16 @@ surface to the user without requiring the LLM to volunteer them.
 
 ### Failure handling
 
-- Each `(provider, sub-query)` search runs in its own thread; an exception
-  in one is caught, logged, and recorded as a `ProviderFailure` — it does
-  not affect the other provider or other sub-queries.
+- Official API providers (Tavily) run each `(provider, sub-query)` search in
+  its own thread; an exception in one is caught, logged, and recorded as a
+  `ProviderFailure` — it does not affect the provider, other sub-queries, or
+  the other provider.
+- Scraper providers (DuckDuckGo via `ddgs`) are not thread-safe: they wrap a
+  curl-based session, and hammering them with concurrent requests can
+  corrupt the process heap and crash later in unrelated native code. They
+  declare `parallel_ok = False` and the orchestrator runs their sub-queries
+  sequentially in a single worker instead. It's also more polite to the
+  unofficial endpoint.
 - If a provider fails to *initialize* (e.g. missing `TAVILY_API_KEY`), the
   CLI drops it and continues with whatever's left, rather than crashing at
   startup.
@@ -137,10 +149,16 @@ surface to the user without requiring the LLM to volunteer them.
   are exhausted: the planner falls back to searching the raw question, and
   the synthesizer returns the evidence unprocessed with an explanatory
   note, so a dead LLM degrades the answer rather than aborting the run.
-- The embedding model is treated as an enhancement, not a dependency:
-  ranking falls back to lexical token-overlap scoring, and near-duplicate
-  detection is skipped (exact-URL dedup still applies) if the model is
-  unavailable or its download fails.
+- The embedding model is *off by default* (`RESEARCH_AGENT_EMBEDDINGS=1`
+  enables it). The default near-duplicate detection is a dependency-free
+  word-shingle Jaccard comparison, and the default ranking is lexical
+  token-overlap scoring — pure Python, no `torch`/`sklearn`/`pandas`/
+  `pyarrow`. This matters because those native packages can segfault (not
+  just raise) on very new Python builds, and a native crash is *not*
+  catchable by `try/except`; keeping them off the critical path makes the
+  pipeline robust on machines where they misbehave. When the opt-in
+  embedding path fails with a *Python* exception, dedup/ranking fall back
+  to the dependency-free versions automatically.
 - If **all** providers fail or return nothing, the synthesizer returns an
   explicit "no usable evidence" message instead of hallucinating an answer.
 - Any provider failures that did occur are surfaced to the user in the
@@ -186,10 +204,11 @@ pytest tests/
 |---|---|
 | LangGraph | Explicit state graph maps directly onto the required separation of search/fetch/rank/verify/synthesize into distinct modules, and makes the control flow inspectable/testable node by node. |
 | Tavily + DuckDuckGo | See "Why these two sources" above. |
-| `all-MiniLM-L6-v2` | Small, fast, CPU-friendly embedding model — reused for both near-dup detection and ranking so there's only one embedding model to load. |
+| Dedup/rank (default) | Word-shingle Jaccard near-dup + lexical token-overlap ranking — pure Python, no native ML deps on the critical path, so the pipeline is robust even on very new Python builds. |
+| `all-MiniLM-L6-v2` (opt-in) | When `RESEARCH_AGENT_EMBEDDINGS=1`, a small CPU-friendly embedding model sharpens both near-dup detection and ranking; one model reused by both stages. |
 | `trafilatura` | Purpose-built for boilerplate-free article extraction, more robust than naive BeautifulSoup text scraping across arbitrary sites. |
 | `tenacity` | Declarative retry/backoff for LLM calls without hand-rolled loops. |
-| Groq (Llama 3.3 70B) | Used for both planning and synthesis. Free tier, no card required, and fast inference. A single `agent/llm.py` choke point makes swapping to a different provider/model a one-file change. |
+| Groq (Llama 3.3 70B / GPT-OSS) | Used for both planning and synthesis. Free tier, no card required, and fast inference. A single `agent/llm.py` choke point makes swapping to a different provider/model a one-file change. |
 
 ## API limits, costs, and assumptions
 
@@ -206,9 +225,15 @@ pytest tests/
   scrapes the web UI); it can throttle or challenge automated clients, and
   it's out of our control. That's part of why it's paired with a second,
   keyed provider rather than trusted alone.
-- **Embedding model download** — `all-MiniLM-L6-v2` is fetched from SF on
-  first use (~90 MB). First run needs network; afterwards it's cached and
-  both dedup and ranking work fully offline.
+- **Embedding model (optional)** — `all-MiniLM-L6-v2` is only downloaded
+  when `RESEARCH_AGENT_EMBEDDINGS=1` is set (~90 MB from SF on first use).
+  The default dependency-free path needs no model download and works fully
+  offline.
+- **Environment/Python caveat** — heavy native ML packages (`torch`,
+  `sklearn`, `pandas`, `pyarrow`) can crash with a hard segfault on very
+  new Python versions (3.14+); a native crash cannot be caught in Python.
+  Because embeddings are opt-in, a machine where those packages misbehave
+  still runs the full pipeline on the dependency-free default.
 - **Assumptions** — the question is asked in English; sources are assumed to
   be publicly fetchable over HTTP; results describe a point-in-time state of
   the web (no freshness/recency weighting).
@@ -221,9 +246,12 @@ pytest tests/
 - Conflict *detection* across sources is left entirely to the LLM's reading
   of the evidence block; there's no structured claim-extraction/comparison
   step, so subtle numeric or date conflicts across sources may be missed.
-- Near-duplicate detection uses a fixed 0.92 threshold; it hasn't been
-  tuned against a labeled dataset and may occasionally over- or
-  under-merge.
+- Near-duplicate detection uses fixed thresholds (shingle Jaccard ≥0.75 by
+  default, embedding cosine >0.92 when opted in); neither has been tuned
+  against a labeled dataset, so both may occasionally over- or under-merge.
+- The dependency-free lexical ranking is a token-overlap heuristic; it's
+  weaker than semantic similarity at matching paraphrased-but-relevant
+  results, which is why the embedding path exists as an opt-in.
 - `trafilatura` extraction can fail silently on heavily JS-rendered pages
   (SPAs); the pipeline falls back to the search snippet, but this can be a
   noticeably weaker piece of evidence for such pages.
@@ -248,30 +276,32 @@ pytest tests/
 The test suite (`tests/`) runs with no API keys and no model download:
 
 - `test_dedup.py` — URL canonicalization (tracking-param stripping, trailing
-  slashes, scheme/domain normalization) and exact-URL dedup.
+  slashes, scheme/domain normalization), exact-URL dedup, and shingle-based
+  near-duplicate detection.
 - `test_planner.py` — JSON parsing, markdown-fence stripping, and graceful
   fallback when the LLM crashes or returns garbage.
 - `test_fetcher.py` — transport/HTTP/timeout errors return `None` (never
   crash the run); happy path extracts body text.
-- `test_ranker.py` — lexical fallback behaves sanely when the embedding
-  model is missing, respects `top_k`, handles empty input.
+- `test_ranker.py` — the dependency-free lexical path by default (embedding
+  path is *not* invoked without the opt-in), clean lexical fallback when the
+  embedding path errors, `top_k` respected, empty input handled.
 - `test_verifier.py` — single-provider / single-domain / snippet-only
   grounding notes, and citation out-of-range / missing checks.
 
 The LLM-dependent stages (real planning, synthesis) and the retrievers are
 not unit-tested against live endpoints (they need keys/network and are rate
-limited); they're exercised end-to-end via `python main.py "..."`, shown in
-the demo video. Any provider/LLM failure in that path degrades with an
-explicit note rather than crashing, which is itself part of the
-evaluation.
+limited); they're exercised end-to-end via `python main.py "..."`. The
+end-to-end run also doubles as a failure-injection test in practice:
+provider/LLM/fetch failures in that path degrade with an explicit note
+rather than crashing.
 
 ## Implementation notes
 
 All modules (`planner`, `retrievers/*`, `dedup`, `ranker`, `fetcher`,
 `verifier`, `synthesizer`, `graph`, `llm`) and the CLI (`main.py`) were
 written for this submission. Pure-logic components (URL canonicalization,
-exact dedup, planner failure/fallback, fetch error handling, ranker
-fallback, verifier checks) are covered by unit tests in `tests/` that run
-without API keys; the embedding path, retrievers, and LLM synthesis require
-network access / API keys and are exercised via the end-to-end CLI run shown
-in the demo video.
+exact dedup, shingle near-dup, planner failure/fallback, fetch error
+handling, ranker behavior, verifier checks) are covered by unit tests in
+`tests/` that run without API keys; the opt-in embedding path, retrievers,
+and LLM synthesis require network access / API keys and are exercised via
+the end-to-end CLI run.

@@ -17,6 +17,16 @@ from agent.retrievers.tavily_retriever import TavilyRetriever
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
+# Answers can contain non-ASCII characters (dashes, quotes, CJK); the default
+# Windows console codec (cp1252) can't encode them and would abort the print.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+# These loggers are chatty during research runs and pollute the demo output.
+for _noisy in ("httpx", "primp", "ddgs", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 
 def main() -> None:
     load_dotenv()

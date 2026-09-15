@@ -2,10 +2,10 @@
 small bonus for source diversity so the shortlist isn't dominated by one
 provider.
 
-Primary path: embedding similarity to the question (all-MiniLM-L6-v2). If
-the model is unavailable (offline, first-run download failure), a lexical
-token-overlap fallback keeps the pipeline alive with a degraded-but-useful
-ranking.
+Default is dependency-free lexical scoring (token overlap with the
+question). Set RESEARCH_AGENT_EMBEDDINGS=1 for embedding-similarity ranking
+(all-MiniLM-L6-v2), which is more semantic but pulls in heavy/native ML
+deps that can be fragile on very new Python builds.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import re
 
 import numpy as np
 
-from agent.dedup import _get_embedder
+from agent.dedup import _embedding_enabled, _get_embedder
 from agent.types import SearchResult
 
 logger = logging.getLogger(__name__)
@@ -51,20 +51,28 @@ def _apply_diversity_and_topk(results: list[SearchResult], top_k: int) -> list[S
     return ranked[:top_k]
 
 
+def _rank_embedding(question: str, results: list[SearchResult]) -> None:
+    model = _get_embedder()
+    query_emb = model.encode([question], normalize_embeddings=True)[0]
+    doc_embs = model.encode(
+        [f"{r.title} {r.snippet}" for r in results], normalize_embeddings=True
+    )
+    for r, emb in zip(results, doc_embs):
+        r.score = float(np.dot(query_emb, emb))
+
+
 def rank(question: str, results: list[SearchResult], top_k: int = 8) -> list[SearchResult]:
     if not results:
         return []
 
-    try:
-        model = _get_embedder()
-        query_emb = model.encode([question], normalize_embeddings=True)[0]
-        doc_embs = model.encode(
-            [f"{r.title} {r.snippet}" for r in results], normalize_embeddings=True
-        )
-        for r, emb in zip(results, doc_embs):
-            r.score = float(np.dot(query_emb, emb))
-    except Exception as exc:
-        logger.warning("Embedding ranking unavailable (%s); using lexical fallback", exc)
+    if _embedding_enabled():
+        try:
+            _rank_embedding(question, results)
+        except Exception as exc:
+            logger.warning("Embedding ranking unavailable (%s); using lexical fallback", exc)
+            for r in results:
+                r.score = _lexical_score(question, r)
+    else:
         for r in results:
             r.score = _lexical_score(question, r)
 

@@ -13,9 +13,16 @@ import os
 from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-MODEL = os.environ.get("RESEARCH_AGENT_MODEL", "llama-3.3-70b-versatile")
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 _client: Groq | None = None
+
+
+def _get_model() -> str:
+    # Read lazily (not at import time): main.py imports the agent package
+    # before load_dotenv() runs, so an import-time read would see the .env
+    # value missing and silently pick the default model.
+    return os.environ.get("RESEARCH_AGENT_MODEL", DEFAULT_MODEL)
 
 
 def _get_client() -> Groq:
@@ -38,7 +45,7 @@ def call_llm(prompt: str, max_tokens: int = 1024, system: str | None = None) -> 
     messages.append({"role": "user", "content": prompt})
 
     response = _get_client().chat.completions.create(
-        model=MODEL,
+        model=_get_model(),
         max_tokens=max_tokens,
         messages=messages,
     )

@@ -33,22 +33,47 @@ def build_graph(retrievers: list[Retriever], top_k: int = 8, fetch_top_n: int = 
         raw_results: list[SearchResult] = []
         failures: list[ProviderFailure] = []
 
-        # Fan out: every (provider, sub_query) pair runs concurrently and
-        # failures are isolated per-pair so one bad provider/query never
-        # takes down the whole search step.
+        def search_one(retriever: Retriever, query: str) -> tuple[list[SearchResult], list[ProviderFailure]]:
+            try:
+                return retriever.search(query, 5), []
+            except Exception as exc:  # provider-specific errors vary widely
+                logger.warning("Provider %s failed on '%s': %s", retriever.name, query, exc)
+                return [], [ProviderFailure(source=retriever.name, reason=str(exc))]
+
+        def search_sequential(retriever: Retriever, queries: list[str]) -> tuple[list[SearchResult], list[ProviderFailure]]:
+            # For scrapers that aren't thread-safe (parallel_ok=False), run
+            # their sub-queries in order inside a single worker instead of
+            # fanning out into concurrent requests.
+            results: list[SearchResult] = []
+            fails: list[ProviderFailure] = []
+            for query in queries:
+                res, f = search_one(retriever, query)
+                results.extend(res)
+                fails.extend(f)
+            return results, fails
+
+        # Fan out: official APIs run each (retriever, sub-query) concurrently
+        # with failure isolation per pair; unofficial scrapers are
+        # sequentialized. One provider's failure never affects the others.
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             futures = {}
             for retriever in retrievers:
-                for sub_query in state["sub_queries"]:
-                    fut = pool.submit(retriever.search, sub_query, 5)
-                    futures[fut] = (retriever.name, sub_query)
+                if getattr(retriever, "parallel_ok", True):
+                    for sub_query in state["sub_queries"]:
+                        fut = pool.submit(search_one, retriever, sub_query)
+                        futures[fut] = retriever.name
+                else:
+                    fut = pool.submit(search_sequential, retriever, state["sub_queries"])
+                    futures[fut] = retriever.name
 
             for fut in concurrent.futures.as_completed(futures):
-                source, sub_query = futures[fut]
+                source = futures[fut]
                 try:
-                    raw_results.extend(fut.result())
-                except Exception as exc:  # provider-specific errors vary widely
-                    logger.warning("Provider %s failed on '%s': %s", source, sub_query, exc)
+                    res, f = fut.result()
+                    raw_results.extend(res)
+                    failures.extend(f)
+                except Exception as exc:  # should not happen (all caught above), keep it from failing the run
+                    logger.warning("Provider %s failed: %s", source, exc)
                     failures.append(ProviderFailure(source=source, reason=str(exc)))
 
         return {**state, "raw_results": raw_results, "provider_failures": failures}

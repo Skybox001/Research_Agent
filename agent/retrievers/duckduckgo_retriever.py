@@ -7,7 +7,15 @@ from agent.types import SearchResult
 
 
 class DuckDuckGoRetriever(Retriever):
+    """Unofficial scraper over DuckDuckGo's web front-ends.
+
+    Not safe to run concurrently from many threads (the underlying
+    ddgs/primp curl session isn't thread-safe), so parallel_ok = False to
+    make the orchestrator sequentialize this provider's sub-queries.
+    """
+
     name = "duckduckgo"
+    parallel_ok = False
 
     def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
         results = []

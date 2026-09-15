@@ -15,6 +15,13 @@ from agent.types import SearchResult
 class Retriever(ABC):
     name: str
 
+    # Whether search() is safe to call concurrently from many threads.
+    # Official HTTP APIs (Tavily) are; unofficial web scrapers (DuckDuckGo
+    # via the ddgs/primp curl-based front-end) are not thread-safe — hammering
+    # them in parallel can corrupt the process and crash later in unrelated
+    # native code. The orchestrator honors this flag.
+    parallel_ok: bool = True
+
     @abstractmethod
     def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
         """Run a search and return normalized results.
